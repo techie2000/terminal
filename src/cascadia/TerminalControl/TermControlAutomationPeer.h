@@ -28,7 +28,6 @@ Modifications:
 
 #pragma once
 
-#include "TermControl.h"
 #include "ControlInteractivity.h"
 #include "TermControlAutomationPeer.g.h"
 #include "../types/TermControlUiaProvider.hpp"
@@ -37,18 +36,21 @@ Modifications:
 
 namespace winrt::Microsoft::Terminal::Control::implementation
 {
+    struct TermControl;
+
     struct TermControlAutomationPeer :
         public TermControlAutomationPeerT<TermControlAutomationPeer>,
         ::Microsoft::Console::Types::IUiaEventDispatcher
     {
     public:
-        TermControlAutomationPeer(Microsoft::Terminal::Control::implementation::TermControl* owner,
+        TermControlAutomationPeer(winrt::com_ptr<Microsoft::Terminal::Control::implementation::TermControl> owner,
                                   const Core::Padding padding,
                                   Control::InteractivityAutomationPeer implementation);
 
         void UpdateControlBounds();
         void SetControlPadding(const Core::Padding padding);
         void RecordKeyEvent(const WORD vkey);
+        void Close();
 
 #pragma region FrameworkElementAutomationPeer
         hstring GetClassNameCore() const;
@@ -78,8 +80,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
 #pragma endregion
 
     private:
-        winrt::Microsoft::Terminal::Control::implementation::TermControl* _termControl;
+        winrt::weak_ref<Microsoft::Terminal::Control::implementation::TermControl> _termControl;
         Control::InteractivityAutomationPeer _contentAutomationPeer;
-        std::deque<wchar_t> _keyEvents;
+        til::shared_mutex<std::deque<wchar_t>> _keyEvents;
     };
 }

@@ -3,6 +3,12 @@
 
 namespace Microsoft.Terminal.Core
 {
+    enum MatchMode
+    {
+        None,
+        All
+    };
+
     enum CursorStyle
     {
         Vintage,
@@ -11,6 +17,13 @@ namespace Microsoft.Terminal.Core
         DoubleUnderscore,
         FilledBox,
         EmptyBox
+    };
+
+    enum AdjustTextMode
+    {
+        Never,
+        Indexed,
+        Always
     };
 
     // TerminalCore declares its own Color struct to avoid depending
@@ -46,10 +59,10 @@ namespace Microsoft.Terminal.Core
     // Same thing here, but with padding. Can't use Windows.UI.Thickness, so
     // we'll declare our own.
     struct Padding {
-        Double Left;
-        Double Top;
-        Double Right;
-        Double Bottom;
+        Single Left;
+        Single Top;
+        Single Right;
+        Single Bottom;
     };
 
     // This is a projection of Microsoft::Terminal::Core::ControlKeyStates,
@@ -102,12 +115,15 @@ namespace Microsoft.Terminal.Core
     {
         Microsoft.Terminal.Core.Color DefaultForeground;
         Microsoft.Terminal.Core.Color DefaultBackground;
+        Microsoft.Terminal.Core.Color SelectionBackground;
         Microsoft.Terminal.Core.Color GetColorTableEntry(Int32 index);
         Microsoft.Terminal.Core.Color CursorColor;
         CursorStyle CursorShape;
         UInt32 CursorHeight;
         Boolean IntenseIsBold;
         Boolean IntenseIsBright;
-        Boolean AdjustIndistinguishableColors;
+        AdjustTextMode AdjustIndistinguishableColors;
+
+        // NOTE! When adding something here, make sure to update ControlProperties.h too!
     };
 }
