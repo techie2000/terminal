@@ -30,6 +30,11 @@ class UtilsTests
     TEST_METHOD(TestMangleWSLPaths);
 #endif
 
+    TEST_METHOD(TestTrimTrailingWhitespace);
+    TEST_METHOD(TestDontTrimTrailingWhitespace);
+
+    TEST_METHOD(TestEvaluateStartingDirectory);
+
     void _VerifyXTermColorResult(const std::wstring_view wstr, DWORD colorValue);
     void _VerifyXTermColorInvalid(const std::wstring_view wstr);
 };
@@ -61,15 +66,23 @@ void UtilsTests::TestClampToShortMax()
 
 void UtilsTests::TestGuidToString()
 {
-    constexpr GUID constantGuid{
+    static constexpr GUID constantGuid{
         0x01020304, 0x0506, 0x0708, { 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 }
     };
-    constexpr std::wstring_view constantGuidString{ L"{01020304-0506-0708-090a-0b0c0d0e0f10}" };
 
-    auto generatedGuid{ GuidToString(constantGuid) };
+    {
+        const auto str = GuidToString(constantGuid);
+        const auto guid = GuidFromString(str.c_str());
+        VERIFY_ARE_EQUAL(L"{01020304-0506-0708-090a-0b0c0d0e0f10}", str);
+        VERIFY_ARE_EQUAL(constantGuid, guid);
+    }
 
-    VERIFY_ARE_EQUAL(constantGuidString.size(), generatedGuid.size());
-    VERIFY_ARE_EQUAL(constantGuidString, generatedGuid);
+    {
+        const auto str = GuidToPlainString(constantGuid);
+        const auto guid = GuidFromPlainString(str.c_str());
+        VERIFY_ARE_EQUAL(L"01020304-0506-0708-090a-0b0c0d0e0f10", str);
+        VERIFY_ARE_EQUAL(constantGuid, guid);
+    }
 }
 
 void UtilsTests::TestSplitString()
@@ -326,9 +339,9 @@ void UtilsTests::TestColorFromXTermColor()
 
 void UtilsTests::_VerifyXTermColorResult(const std::wstring_view wstr, DWORD colorValue)
 {
-    auto color = ColorFromXTermColor(wstr);
+    const auto color = ColorFromXTermColor(wstr);
     VERIFY_IS_TRUE(color.has_value());
-    VERIFY_ARE_EQUAL(colorValue, (COLORREF)color.value());
+    VERIFY_ARE_EQUAL(colorValue, static_cast<COLORREF>(color.value()));
 }
 
 void UtilsTests::_VerifyXTermColorInvalid(const std::wstring_view wstr)
@@ -505,3 +518,103 @@ void UtilsTests::TestMangleWSLPaths()
     }
 }
 #endif
+
+void UtilsTests::TestTrimTrailingWhitespace()
+{
+    // Continue on failures
+    const WEX::TestExecution::DisableVerifyExceptions disableExceptionsScope;
+
+    // Tests for GH #11473
+    VERIFY_ARE_EQUAL(L"Foo", TrimPaste(L"Foo   "));
+    VERIFY_ARE_EQUAL(L"Foo", TrimPaste(L"Foo\n"));
+    VERIFY_ARE_EQUAL(L"Foo", TrimPaste(L"Foo\n\n"));
+    VERIFY_ARE_EQUAL(L"Foo", TrimPaste(L"Foo\r\n"));
+    VERIFY_ARE_EQUAL(L"Foo Bar", TrimPaste(L"Foo Bar\n"));
+    VERIFY_ARE_EQUAL(L"Foo\tBar", TrimPaste(L"Foo\tBar\n"));
+
+    VERIFY_ARE_EQUAL(L"Foo Bar", TrimPaste(L"Foo Bar\t"), L"Trim when there is a tab at the end.");
+    VERIFY_ARE_EQUAL(L"Foo Bar", TrimPaste(L"Foo Bar\t\t"), L"Trim when there are tabs at the end.");
+    VERIFY_ARE_EQUAL(L"Foo Bar", TrimPaste(L"Foo Bar\t\n"), L"Trim when there are tabs at the start of the whitespace at the end.");
+    VERIFY_ARE_EQUAL(L"Foo\tBar", TrimPaste(L"Foo\tBar\t\n"), L"Trim when there are tabs in the middle of the string, and in the whitespace at the end.");
+    VERIFY_ARE_EQUAL(L"Foo\tBar", TrimPaste(L"Foo\tBar\n\t"), L"Trim when there are tabs in the middle of the string, and in the whitespace at the end.");
+    VERIFY_ARE_EQUAL(L"Foo\tBar", TrimPaste(L"Foo\tBar\t\n\t"), L"Trim when there are tabs in the middle of the string, and in the whitespace at the end.");
+}
+void UtilsTests::TestDontTrimTrailingWhitespace()
+{
+    // Continue on failures
+    const WEX::TestExecution::DisableVerifyExceptions disableExceptionsScope;
+
+    VERIFY_ARE_EQUAL(L"Foo\tBar", TrimPaste(L"Foo\tBar"));
+
+    // Tests for GH #12387
+    VERIFY_ARE_EQUAL(L"Foo\nBar\n", TrimPaste(L"Foo\nBar\n"));
+    VERIFY_ARE_EQUAL(L"Foo  Baz\nBar\n", TrimPaste(L"Foo  Baz\nBar\n"));
+    VERIFY_ARE_EQUAL(L"Foo\tBaz\nBar\n", TrimPaste(L"Foo\tBaz\nBar\n"), L"Don't trim when there's a trailing newline, and tabs in the middle");
+    VERIFY_ARE_EQUAL(L"Foo\tBaz\nBar\t\n", TrimPaste(L"Foo\tBaz\nBar\t\n"), L"Don't trim when there's a trailing newline, and tabs in the middle");
+
+    // We need to both
+    // * trim when there's a tab followed by only whitespace
+    // * not trim then there's a tab in the middle, and the string ends in whitespace
+}
+
+void UtilsTests::TestEvaluateStartingDirectory()
+{
+    // Continue on failures
+    const WEX::TestExecution::DisableVerifyExceptions disableExceptionsScope;
+
+    auto test = [](auto& expected, auto& cwd, auto& startingDir) {
+        VERIFY_ARE_EQUAL(expected, EvaluateStartingDirectory(cwd, startingDir));
+    };
+
+    // A NOTE: EvaluateStartingDirectory makes no attempt to cannonicalize the
+    // path. So if you do any sort of relative paths, it'll literally just
+    // append.
+
+    {
+        std::wstring cwd = L"C:\\Windows\\System32";
+
+        // Literally blank
+        test(L"C:\\Windows\\System32\\", cwd, L"");
+
+        // Absolute Windows path
+        test(L"C:\\Windows", cwd, L"C:\\Windows");
+        test(L"C:/Users/migrie", cwd, L"C:/Users/migrie");
+
+        // Relative Windows path
+        test(L"C:\\Windows\\System32\\.", cwd, L"."); // ?
+        test(L"C:\\Windows\\System32\\.\\System32", cwd, L".\\System32"); // ?
+        test(L"C:\\Windows\\System32\\./dev", cwd, L"./dev");
+
+        // WSL '~' path
+        test(L"~", cwd, L"~");
+        test(L"~/dev", cwd, L"~/dev");
+
+        // WSL or Windows / path - this will ultimately be evaluated by the connection
+        test(L"/", cwd, L"/");
+        test(L"/dev", cwd, L"/dev");
+    }
+
+    {
+        std::wstring cwd = L"C:/Users/migrie";
+
+        // Literally blank
+        test(L"C:/Users/migrie\\", cwd, L"");
+
+        // Absolute Windows path
+        test(L"C:\\Windows", cwd, L"C:\\Windows");
+        test(L"C:/Users/migrie", cwd, L"C:/Users/migrie");
+
+        // Relative Windows path
+        test(L"C:/Users/migrie\\.", cwd, L"."); // ?
+        test(L"C:/Users/migrie\\.\\System32", cwd, L".\\System32"); // ?
+        test(L"C:/Users/migrie\\./dev", cwd, L"./dev");
+
+        // WSL '~' path
+        test(L"~", cwd, L"~");
+        test(L"~/dev", cwd, L"~/dev");
+
+        // WSL or Windows / path - this will ultimately be evaluated by the connection
+        test(L"/", cwd, L"/");
+        test(L"/dev", cwd, L"/dev");
+    }
+}

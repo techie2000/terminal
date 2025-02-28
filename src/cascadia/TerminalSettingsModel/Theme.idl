@@ -4,11 +4,36 @@
 namespace Microsoft.Terminal.Settings.Model
 {
 
+    enum IconStyle
+    {
+        Default,
+        Hidden,
+        Monochrome
+    };
+
     enum ThemeColorType
     {
         Accent,
         Color,
         TerminalBackground
+    };
+
+    enum TabCloseButtonVisibility
+    {
+        Always,
+        Hover,
+        Never,
+        ActiveOnly
+    };
+
+    [default_interface] runtimeclass ThemePair
+    {
+        ThemePair();
+        ThemePair(String name);
+        ThemePair(String darkName, String lightName);
+
+        String DarkName;
+        String LightName;
     };
 
     runtimeclass ThemeColor
@@ -25,11 +50,20 @@ namespace Microsoft.Terminal.Settings.Model
         Windows.UI.Xaml.Media.Brush Evaluate(Windows.UI.Xaml.ResourceDictionary res,
                                              Windows.UI.Xaml.Media.Brush terminalBackground,
                                              Boolean forTitlebar);
+        UInt8 UnfocusedTabOpacity { get; };
+    }
+
+    runtimeclass SettingsTheme
+    {
+        Windows.UI.Xaml.ElementTheme RequestedTheme { get; };
     }
 
     runtimeclass WindowTheme {
         Windows.UI.Xaml.ElementTheme RequestedTheme { get; };
         Boolean UseMica { get; };
+        Boolean RainbowFrame { get; };
+        ThemeColor Frame { get; };
+        ThemeColor UnfocusedFrame { get; };
     }
 
     runtimeclass TabRowTheme {
@@ -39,6 +73,9 @@ namespace Microsoft.Terminal.Settings.Model
 
     runtimeclass TabTheme {
         ThemeColor Background { get; };
+        ThemeColor UnfocusedBackground { get; };
+        TabCloseButtonVisibility ShowCloseButton { get; };
+        IconStyle IconStyle { get; };
     }
 
     [default_interface] runtimeclass Theme : Windows.Foundation.IStringable {
@@ -50,6 +87,9 @@ namespace Microsoft.Terminal.Settings.Model
         // window.* Namespace
         WindowTheme Window { get; };
 
+        // settings.* Namespace
+        SettingsTheme Settings { get; };
+            
         // tabRow.* Namespace
         TabRowTheme TabRow { get; };
 
@@ -58,6 +98,7 @@ namespace Microsoft.Terminal.Settings.Model
 
         // A helper for retrieving the RequestedTheme out of the window property
         Windows.UI.Xaml.ElementTheme RequestedTheme { get; };
+        static Boolean IsSystemInDarkTheme();
 
     }
 }

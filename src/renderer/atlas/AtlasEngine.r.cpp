@@ -4,7 +4,8 @@
 #include "pch.h"
 #include "AtlasEngine.h"
 
-#include "dwrite.h"
+#include "BackendD2D.h"
+#include "BackendD3D.h"
 
 // #### NOTE ####
 // If you see any code in here that contains "_api." you might be seeing a race condition.
@@ -18,10 +19,11 @@
 // Disable a bunch of warnings which get in the way of writing performant code.
 #pragma warning(disable : 26429) // Symbol 'data' is never tested for nullness, it can be marked as not_null (f.23).
 #pragma warning(disable : 26446) // Prefer to use gsl::at() instead of unchecked subscript operator (bounds.4).
+#pragma warning(disable : 26459) // You called an STL function '...' with a raw pointer parameter at position '...' that may be unsafe [...].
 #pragma warning(disable : 26481) // Don't use pointer arithmetic. Use span instead (bounds.1).
 #pragma warning(disable : 26482) // Only index into arrays using constant expressions (bounds.2).
 
-using namespace Microsoft::Console::Render;
+using namespace Microsoft::Console::Render::Atlas;
 
 #pragma region IRenderEngine
 
@@ -30,330 +32,473 @@ using namespace Microsoft::Console::Render;
 [[nodiscard]] HRESULT AtlasEngine::Present() noexcept
 try
 {
-    _adjustAtlasSize();
-    _processGlyphQueue();
-
-    if (WI_IsFlagSet(_r.invalidations, RenderInvalidations::Cursor))
+    if (!_p.dxgi.adapter)
     {
-        _drawCursor();
-        WI_ClearFlag(_r.invalidations, RenderInvalidations::Cursor);
+        _recreateAdapter();
     }
 
-    // The values the constant buffer depends on are potentially updated after BeginPaint().
-    if (WI_IsFlagSet(_r.invalidations, RenderInvalidations::ConstBuffer))
+    if (!_b)
     {
-        _updateConstantBuffer();
-        WI_ClearFlag(_r.invalidations, RenderInvalidations::ConstBuffer);
+        _recreateBackend();
     }
 
+    if (_p.swapChain.generation != _p.s.generation())
     {
-#pragma warning(suppress : 26494) // Variable 'mapped' is uninitialized. Always initialize an object (type.5).
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        THROW_IF_FAILED(_r.deviceContext->Map(_r.cellBuffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
-        assert(mapped.RowPitch >= _r.cells.size() * sizeof(Cell));
-        memcpy(mapped.pData, _r.cells.data(), _r.cells.size() * sizeof(Cell));
-        _r.deviceContext->Unmap(_r.cellBuffer.get(), 0);
+        _handleSwapChainUpdate();
     }
 
-    // After Present calls, the back buffer needs to explicitly be
-    // re-bound to the D3D11 immediate context before it can be used again.
-    _r.deviceContext->OMSetRenderTargets(1, _r.renderTargetView.addressof(), nullptr);
-    _r.deviceContext->Draw(3, 0);
-
-    // See documentation for IDXGISwapChain2::GetFrameLatencyWaitableObject method:
-    // > For every frame it renders, the app should wait on this handle before starting any rendering operations.
-    // > Note that this requirement includes the first frame the app renders with the swap chain.
-    assert(debugGeneralPerformance || _r.frameLatencyWaitableObjectUsed);
-
-    // > IDXGISwapChain::Present: Partial Presentation (using a dirty rects or scroll) is not supported
-    // > for SwapChains created with DXGI_SWAP_EFFECT_DISCARD or DXGI_SWAP_EFFECT_FLIP_DISCARD.
-    // ---> No need to call IDXGISwapChain1::Present1.
-    //      TODO: Would IDXGISwapChain1::Present1 and its dirty rects have benefits for remote desktop?
-    THROW_IF_FAILED(_r.swapChain->Present(1, 0));
-
-    // On some GPUs with tile based deferred rendering (TBDR) architectures, binding
-    // RenderTargets that already have contents in them (from previous rendering) incurs a
-    // cost for having to copy the RenderTarget contents back into tile memory for rendering.
-    //
-    // On Windows 10 with DXGI_SWAP_EFFECT_FLIP_DISCARD we get this for free.
-    if (!_sr.isWindows10OrGreater)
-    {
-        _r.deviceContext->DiscardView(_r.renderTargetView.get());
-    }
-
+    _b->Render(_p);
+    _present();
     return S_OK;
 }
 catch (const wil::ResultException& exception)
 {
-    // TODO: this writes to _api.
-    return _handleException(exception);
+    const auto hr = exception.GetErrorCode();
+
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == D2DERR_RECREATE_TARGET)
+    {
+        _p.dxgi = {};
+        return E_PENDING;
+    }
+
+    if (_p.warningCallback)
+    {
+        try
+        {
+            _p.warningCallback(hr, {});
+        }
+        CATCH_LOG()
+    }
+
+    _b.reset();
+    return hr;
 }
 CATCH_RETURN()
 
+[[nodiscard]] bool AtlasEngine::RequiresContinuousRedraw() noexcept
+{
+    return ATLAS_DEBUG_CONTINUOUS_REDRAW || (_b && _b->RequiresContinuousRedraw());
+}
+
+void AtlasEngine::WaitUntilCanRender() noexcept
+{
+    if constexpr (ATLAS_DEBUG_RENDER_DELAY)
+    {
+        Sleep(ATLAS_DEBUG_RENDER_DELAY);
+    }
+    _waitUntilCanRender();
+}
+
 #pragma endregion
 
-void AtlasEngine::_setShaderResources() const
+void AtlasEngine::_recreateAdapter()
 {
-    _r.deviceContext->VSSetShader(_r.vertexShader.get(), nullptr, 0);
-    _r.deviceContext->PSSetShader(_r.pixelShader.get(), nullptr, 0);
-
-    // Our vertex shader uses a trick from Bill Bilodeau published in
-    // "Vertex Shader Tricks" at GDC14 to draw a fullscreen triangle
-    // without vertex/index buffers. This prepares our context for this.
-    _r.deviceContext->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
-    _r.deviceContext->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
-    _r.deviceContext->IASetInputLayout(nullptr);
-    _r.deviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-    _r.deviceContext->PSSetConstantBuffers(0, 1, _r.constantBuffer.addressof());
-
-    const std::array resources{ _r.cellView.get(), _r.atlasView.get() };
-    _r.deviceContext->PSSetShaderResources(0, gsl::narrow_cast<UINT>(resources.size()), resources.data());
-}
-
-void AtlasEngine::_updateConstantBuffer() const noexcept
-{
-    const auto useClearType = _api.realizedAntialiasingMode == D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE;
-
-    ConstBuffer data;
-    data.viewport.x = 0;
-    data.viewport.y = 0;
-    data.viewport.z = static_cast<float>(_r.cellCount.x * _r.cellSize.x);
-    data.viewport.w = static_cast<float>(_r.cellCount.y * _r.cellSize.y);
-    DWrite_GetGammaRatios(_r.gamma, data.gammaRatios);
-    data.enhancedContrast = useClearType ? _r.cleartypeEnhancedContrast : _r.grayscaleEnhancedContrast;
-    data.cellCountX = _r.cellCount.x;
-    data.cellSize.x = _r.cellSize.x;
-    data.cellSize.y = _r.cellSize.y;
-    data.underlinePos.x = _r.underlinePos;
-    data.underlinePos.y = _r.underlinePos + _r.lineThickness;
-    data.strikethroughPos.x = _r.strikethroughPos;
-    data.strikethroughPos.y = _r.strikethroughPos + _r.lineThickness;
-    data.backgroundColor = _r.backgroundColor;
-    data.cursorColor = _r.cursorOptions.cursorColor;
-    data.selectionColor = _r.selectionColor;
-    data.useClearType = useClearType;
-#pragma warning(suppress : 26447) // The function is declared 'noexcept' but calls function '...' which may throw exceptions (f.6).
-    _r.deviceContext->UpdateSubresource(_r.constantBuffer.get(), 0, nullptr, &data, 0, 0);
-}
-
-void AtlasEngine::_adjustAtlasSize()
-{
-    // Only grow the atlas texture if our tileAllocator needs it to be larger.
-    // We have no way of shrinking our tileAllocator at the moment,
-    // so technically a `requiredSize != _r.atlasSizeInPixel`
-    // comparison would be sufficient, but better safe than sorry.
-    const auto requiredSize = _r.tileAllocator.size();
-    if (requiredSize.y <= _r.atlasSizeInPixel.y && requiredSize.x <= _r.atlasSizeInPixel.x)
+#ifndef NDEBUG
+    if (IsDebuggerPresent())
     {
-        return;
+        // DXGIGetDebugInterface1 returns E_NOINTERFACE on systems without the Windows SDK installed.
+        if (wil::com_ptr<IDXGIInfoQueue> infoQueue; SUCCEEDED_LOG(DXGIGetDebugInterface1(0, IID_PPV_ARGS(infoQueue.addressof()))))
+        {
+            // I didn't want to link with dxguid.lib just for getting DXGI_DEBUG_ALL. This GUID is publicly documented.
+            static constexpr GUID dxgiDebugAll{ 0xe48ae283, 0xda80, 0x490b, { 0x87, 0xe6, 0x43, 0xe9, 0xa9, 0xcf, 0xda, 0x8 } };
+            for (const auto severity : { DXGI_INFO_QUEUE_MESSAGE_SEVERITY_CORRUPTION, DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR, DXGI_INFO_QUEUE_MESSAGE_SEVERITY_WARNING, DXGI_INFO_QUEUE_MESSAGE_SEVERITY_INFO })
+            {
+                LOG_IF_FAILED(infoQueue->SetBreakOnSeverity(dxgiDebugAll, severity, true));
+            }
+        }
+    }
+#endif
+
+#ifndef NDEBUG
+    static constexpr UINT flags = DXGI_CREATE_FACTORY_DEBUG;
+#else
+    static constexpr UINT flags = 0;
+#endif
+
+// IID_PPV_ARGS doesn't work here for some reason.
+#pragma warning(suppress : 26496) // The variable 'hr' does not change after construction, mark it as const (con.4).
+    auto hr = CreateDXGIFactory2(flags, __uuidof(_p.dxgi.factory), _p.dxgi.factory.put_void());
+
+#ifndef NDEBUG
+    // This might be due to missing the "Graphics debugger and GPU profiler for
+    // DirectX" tools. Just as a sanity check, try again without
+    // `DXGI_CREATE_FACTORY_DEBUG`
+    if (FAILED(hr))
+    {
+        hr = CreateDXGIFactory2(0, __uuidof(_p.dxgi.factory), _p.dxgi.factory.put_void());
+    }
+#endif
+    THROW_IF_FAILED(hr);
+
+    wil::com_ptr<IDXGIAdapter1> adapter;
+    DXGI_ADAPTER_DESC1 desc{};
+
+    {
+        const auto useWARP = _p.s->target->useWARP;
+        UINT index = 0;
+
+        do
+        {
+            THROW_IF_FAILED(_p.dxgi.factory->EnumAdapters1(index++, adapter.put()));
+            THROW_IF_FAILED(adapter->GetDesc1(&desc));
+
+            // If useWARP is false we exit during the first iteration. Using the default adapter (index 0)
+            // is the right thing to do under most circumstances, unless you _really_ want to get your hands dirty.
+            // The alternative is to track the window rectangle in respect to all IDXGIOutputs and select the right
+            // IDXGIAdapter, while also considering the "graphics preference" override in the windows settings app, etc.
+            //
+            // If useWARP is true we search until we find the first WARP adapter (usually the last adapter).
+        } while (useWARP && WI_IsFlagClear(desc.Flags, DXGI_ADAPTER_FLAG_SOFTWARE));
     }
 
-    wil::com_ptr<ID3D11Texture2D> atlasBuffer;
-    wil::com_ptr<ID3D11ShaderResourceView> atlasView;
+    if (memcmp(&_p.dxgi.adapterLuid, &desc.AdapterLuid, sizeof(LUID)) != 0)
     {
-        D3D11_TEXTURE2D_DESC desc{};
-        desc.Width = requiredSize.x;
-        desc.Height = requiredSize.y;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.SampleDesc = { 1, 0 };
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-        THROW_IF_FAILED(_r.device->CreateTexture2D(&desc, nullptr, atlasBuffer.addressof()));
-        THROW_IF_FAILED(_r.device->CreateShaderResourceView(atlasBuffer.get(), nullptr, atlasView.addressof()));
-    }
-
-    // If a _r.atlasBuffer already existed, we can copy its glyphs
-    // over to the new texture without re-rendering everything.
-    const auto copyFromExisting = _r.atlasSizeInPixel != u16x2{};
-    if (copyFromExisting)
-    {
-        D3D11_BOX box;
-        box.left = 0;
-        box.top = 0;
-        box.front = 0;
-        box.right = _r.atlasSizeInPixel.x;
-        box.bottom = _r.atlasSizeInPixel.y;
-        box.back = 1;
-        _r.deviceContext->CopySubresourceRegion1(atlasBuffer.get(), 0, 0, 0, 0, _r.atlasBuffer.get(), 0, &box, D3D11_COPY_NO_OVERWRITE);
-    }
-
-    _r.atlasSizeInPixel = requiredSize;
-    _r.atlasBuffer = std::move(atlasBuffer);
-    _r.atlasView = std::move(atlasView);
-    _setShaderResources();
-
-    {
-        const auto surface = _r.atlasBuffer.query<IDXGISurface>();
-
-        wil::com_ptr<IDWriteRenderingParams1> renderingParams;
-        DWrite_GetRenderParams(_sr.dwriteFactory.get(), &_r.gamma, &_r.cleartypeEnhancedContrast, &_r.grayscaleEnhancedContrast, renderingParams.addressof());
-
-        D2D1_RENDER_TARGET_PROPERTIES props{};
-        props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
-        props.pixelFormat = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED };
-        props.dpiX = static_cast<float>(_r.dpi);
-        props.dpiY = static_cast<float>(_r.dpi);
-        THROW_IF_FAILED(_sr.d2dFactory->CreateDxgiSurfaceRenderTarget(surface.get(), &props, _r.d2dRenderTarget.put()));
-
-        // We don't really use D2D for anything except DWrite, but it
-        // can't hurt to ensure that everything it does is pixel aligned.
-        _r.d2dRenderTarget->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
-        // In case _api.realizedAntialiasingMode is D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE we'll
-        // continuously adjust it in AtlasEngine::_drawGlyph. See _drawGlyph.
-        _r.d2dRenderTarget->SetTextAntialiasMode(static_cast<D2D1_TEXT_ANTIALIAS_MODE>(_api.realizedAntialiasingMode));
-        // Ensure that D2D uses the exact same gamma as our shader uses.
-        _r.d2dRenderTarget->SetTextRenderingParams(renderingParams.get());
-    }
-    {
-        static constexpr D2D1_COLOR_F color{ 1, 1, 1, 1 };
-        wil::com_ptr<ID2D1SolidColorBrush> brush;
-        THROW_IF_FAILED(_r.d2dRenderTarget->CreateSolidColorBrush(&color, nullptr, brush.addressof()));
-        _r.brush = brush.query<ID2D1Brush>();
-    }
-
-    WI_SetAllFlags(_r.invalidations, RenderInvalidations::ConstBuffer);
-    WI_SetFlagIf(_r.invalidations, RenderInvalidations::Cursor, !copyFromExisting);
-}
-
-void AtlasEngine::_processGlyphQueue()
-{
-    if (_r.glyphQueue.empty())
-    {
-        return;
-    }
-
-    _r.d2dRenderTarget->BeginDraw();
-    for (const auto& pair : _r.glyphQueue)
-    {
-        _drawGlyph(pair);
-    }
-    THROW_IF_FAILED(_r.d2dRenderTarget->EndDraw());
-
-    _r.glyphQueue.clear();
-}
-
-void AtlasEngine::_drawGlyph(const AtlasQueueItem& item) const
-{
-    const auto key = item.key->data();
-    const auto value = item.value->data();
-    const auto coords = &value->coords[0];
-    const auto charsLength = key->charCount;
-    const auto cells = static_cast<u32>(key->attributes.cellCount);
-    const auto textFormat = _getTextFormat(key->attributes.bold, key->attributes.italic);
-    const auto coloredGlyph = WI_IsFlagSet(value->flags, CellFlags::ColoredGlyph);
-
-    // See D2DFactory::DrawText
-    wil::com_ptr<IDWriteTextLayout> textLayout;
-    THROW_IF_FAILED(_sr.dwriteFactory->CreateTextLayout(&key->chars[0], charsLength, textFormat, cells * _r.cellSizeDIP.x, _r.cellSizeDIP.y, textLayout.addressof()));
-    if (_r.typography)
-    {
-        textLayout->SetTypography(_r.typography.get(), { 0, charsLength });
-    }
-
-    auto options = D2D1_DRAW_TEXT_OPTIONS_CLIP;
-    // D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT enables a bunch of internal machinery
-    // which doesn't have to run if we know we can't use it anyways in the shader.
-    WI_SetFlagIf(options, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, coloredGlyph);
-
-    // Colored glyphs cannot be drawn in linear gamma.
-    // That's why we're simply alpha-blending them in the shader.
-    // In order for this to work correctly we have to prevent them from being drawn
-    // with ClearType, because we would then lack the alpha channel for the glyphs.
-    if (_api.realizedAntialiasingMode == D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE)
-    {
-        _r.d2dRenderTarget->SetTextAntialiasMode(coloredGlyph ? D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE : D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
-    }
-
-    for (u32 i = 0; i < cells; ++i)
-    {
-        const auto coord = coords[i];
-
-        D2D1_RECT_F rect;
-        rect.left = static_cast<float>(coord.x) * static_cast<float>(USER_DEFAULT_SCREEN_DPI) / static_cast<float>(_r.dpi);
-        rect.top = static_cast<float>(coord.y) * static_cast<float>(USER_DEFAULT_SCREEN_DPI) / static_cast<float>(_r.dpi);
-        rect.right = rect.left + _r.cellSizeDIP.x;
-        rect.bottom = rect.top + _r.cellSizeDIP.y;
-
-        D2D1_POINT_2F origin;
-        origin.x = rect.left - i * _r.cellSizeDIP.x;
-        origin.y = rect.top;
-
-        _r.d2dRenderTarget->PushAxisAlignedClip(&rect, D2D1_ANTIALIAS_MODE_ALIASED);
-        _r.d2dRenderTarget->Clear();
-        _r.d2dRenderTarget->DrawTextLayout(origin, textLayout.get(), _r.brush.get(), options);
-        _r.d2dRenderTarget->PopAxisAlignedClip();
+        _p.dxgi.adapter = std::move(adapter);
+        _p.dxgi.adapterLuid = desc.AdapterLuid;
+        _p.dxgi.adapterFlags = desc.Flags;
+        _b.reset();
     }
 }
 
-void AtlasEngine::_drawCursor()
+void AtlasEngine::_recreateBackend()
 {
-    // lineWidth is in D2D's DIPs. For instance if we have a 150-200% zoom scale we want to draw a 2px wide line.
-    // At 150% scale lineWidth thus needs to be 1.33333... because at a zoom scale of 1.5 this results in a 2px wide line.
-    const auto lineWidth = std::max(1.0f, static_cast<float>((_r.dpi + USER_DEFAULT_SCREEN_DPI / 2) / USER_DEFAULT_SCREEN_DPI * USER_DEFAULT_SCREEN_DPI) / static_cast<float>(_r.dpi));
-    const auto cursorType = static_cast<CursorType>(_r.cursorOptions.cursorType);
+    // D3D11 defers the destruction of objects and only one swap chain can be associated with a
+    // HWND, IWindow, or composition surface at a time. --> Destroy it while we still have the old device.
+    _destroySwapChain();
 
-    // `clip` is the rectangle within our texture atlas that's reserved for our cursor texture, ...
-    D2D1_RECT_F clip;
-    clip.left = 0.0f;
-    clip.top = 0.0f;
-    clip.right = _r.cellSizeDIP.x;
-    clip.bottom = _r.cellSizeDIP.y;
+    auto graphicsAPI = _p.s->target->graphicsAPI;
 
-    // ... whereas `rect` is just the visible (= usually white) portion of our cursor.
-    auto rect = clip;
+    auto deviceFlags =
+        D3D11_CREATE_DEVICE_SINGLETHREADED
+#ifndef NDEBUG
+        | D3D11_CREATE_DEVICE_DEBUG
+#endif
+        // This flag prevents the driver from creating a large thread pool for things like shader computations
+        // that would be advantageous for games. For us this has only a minimal performance benefit,
+        // but comes with a large memory usage overhead. At the time of writing the Nvidia
+        // driver launches $cpu_thread_count more worker threads without this flag.
+        | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS
+        // Direct2D support.
+        | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 
-    switch (cursorType)
+    if (WI_IsFlagSet(_p.dxgi.adapterFlags, DXGI_ADAPTER_FLAG_SOFTWARE))
     {
-    case CursorType::Legacy:
-        rect.top = _r.cellSizeDIP.y * static_cast<float>(100 - _r.cursorOptions.heightPercentage) / 100.0f;
-        break;
-    case CursorType::VerticalBar:
-        rect.right = lineWidth;
-        break;
-    case CursorType::EmptyBox:
-    {
-        // EmptyBox is drawn as a line and unlike filled rectangles those are drawn centered on their
-        // coordinates in such a way that the line border extends half the width to each side.
-        // --> Our coordinates have to be 0.5 DIP off in order to draw a 2px line on a 200% scaling.
-        const auto halfWidth = lineWidth / 2.0f;
-        rect.left = halfWidth;
-        rect.top = halfWidth;
-        rect.right -= halfWidth;
-        rect.bottom -= halfWidth;
-        break;
+        // If we're using WARP we don't want to disable those optimizations of course.
+        WI_ClearFlag(deviceFlags, D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS);
+
+        // I'm not sure whether Direct2D is actually faster on WARP, but it's definitely better tested.
+        if (graphicsAPI == GraphicsAPI::Automatic)
+        {
+            graphicsAPI = GraphicsAPI::Direct2D;
+        }
     }
-    case CursorType::Underscore:
-    case CursorType::DoubleUnderscore:
-        rect.top = _r.cellSizeDIP.y - lineWidth;
+
+    wil::com_ptr<ID3D11Device> device0;
+    wil::com_ptr<ID3D11DeviceContext> deviceContext0;
+    D3D_FEATURE_LEVEL featureLevel{};
+
+    static constexpr std::array featureLevels{
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+        D3D_FEATURE_LEVEL_9_3,
+        D3D_FEATURE_LEVEL_9_2,
+        D3D_FEATURE_LEVEL_9_1,
+    };
+
+#pragma warning(suppress : 26496) // The variable 'hr' does not change after construction, mark it as const (con.4).
+    auto hr = D3D11CreateDevice(
+        /* pAdapter           */ _p.dxgi.adapter.get(),
+        /* DriverType         */ D3D_DRIVER_TYPE_UNKNOWN,
+        /* Software           */ nullptr,
+        /* Flags              */ deviceFlags,
+        /* pFeatureLevels     */ featureLevels.data(),
+        /* FeatureLevels      */ gsl::narrow_cast<UINT>(featureLevels.size()),
+        /* SDKVersion         */ D3D11_SDK_VERSION,
+        /* ppDevice           */ device0.put(),
+        /* pFeatureLevel      */ &featureLevel,
+        /* ppImmediateContext */ deviceContext0.put());
+#ifndef NDEBUG
+    if (hr == DXGI_ERROR_SDK_COMPONENT_MISSING)
+    {
+        // This might happen if you don't have "Graphics debugger and GPU
+        // profiler for DirectX" installed in VS. We shouldn't just explode if
+        // you don't though - instead, disable debugging and try again.
+        WI_ClearFlag(deviceFlags, D3D11_CREATE_DEVICE_DEBUG);
+
+        hr = D3D11CreateDevice(
+            /* pAdapter           */ _p.dxgi.adapter.get(),
+            /* DriverType         */ D3D_DRIVER_TYPE_UNKNOWN,
+            /* Software           */ nullptr,
+            /* Flags              */ deviceFlags,
+            /* pFeatureLevels     */ featureLevels.data(),
+            /* FeatureLevels      */ gsl::narrow_cast<UINT>(featureLevels.size()),
+            /* SDKVersion         */ D3D11_SDK_VERSION,
+            /* ppDevice           */ device0.put(),
+            /* pFeatureLevel      */ &featureLevel,
+            /* ppImmediateContext */ deviceContext0.put());
+    }
+#endif
+    THROW_IF_FAILED(hr);
+
+    auto device = device0.query<ID3D11Device2>();
+    auto deviceContext = deviceContext0.query<ID3D11DeviceContext2>();
+
+#ifndef NDEBUG
+    if (IsDebuggerPresent())
+    {
+        if (const auto d3dInfoQueue = device.try_query<ID3D11InfoQueue>())
+        {
+            for (const auto severity : { D3D11_MESSAGE_SEVERITY_CORRUPTION, D3D11_MESSAGE_SEVERITY_ERROR, D3D11_MESSAGE_SEVERITY_WARNING, D3D11_MESSAGE_SEVERITY_INFO })
+            {
+                LOG_IF_FAILED(d3dInfoQueue->SetBreakOnSeverity(severity, true));
+            }
+        }
+    }
+#endif
+
+    if (graphicsAPI == GraphicsAPI::Automatic)
+    {
+        if (featureLevel < D3D_FEATURE_LEVEL_10_0)
+        {
+            graphicsAPI = GraphicsAPI::Direct2D;
+        }
+        else if (featureLevel < D3D_FEATURE_LEVEL_11_0)
+        {
+            D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS options{};
+            if (FAILED(device->CheckFeatureSupport(D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS, &options, sizeof(options))) ||
+                !options.ComputeShaders_Plus_RawAndStructuredBuffers_Via_Shader_4_x)
+            {
+                graphicsAPI = GraphicsAPI::Direct2D;
+            }
+        }
+    }
+
+    _p.device = std::move(device);
+    _p.deviceContext = std::move(deviceContext);
+
+    switch (graphicsAPI)
+    {
+    case GraphicsAPI::Direct2D:
+        _b = std::make_unique<BackendD2D>();
         break;
     default:
+        _b = std::make_unique<BackendD3D>(_p);
         break;
     }
 
-    _r.d2dRenderTarget->BeginDraw();
-    // We need to clip the area we draw in to ensure we don't
-    // accidentally draw into any neighboring texture atlas tiles.
-    _r.d2dRenderTarget->PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
-    _r.d2dRenderTarget->Clear();
+    // This ensures that the backends redraw their entire viewports whenever a new swap chain is created,
+    // EVEN IF we got called when no actual settings changed (i.e. rendering failure, etc.).
+    _p.MarkAllAsDirty();
+}
 
-    if (cursorType == CursorType::EmptyBox)
+void AtlasEngine::_handleSwapChainUpdate()
+{
+    if (_p.swapChain.targetGeneration != _p.s->target.generation())
     {
-        _r.d2dRenderTarget->DrawRectangle(&rect, _r.brush.get(), lineWidth);
+        _createSwapChain();
+    }
+    else if (_p.swapChain.targetSize != _p.s->targetSize)
+    {
+        _resizeBuffers();
+    }
+
+    if (_p.swapChain.fontGeneration != _p.s->font.generation())
+    {
+        _updateMatrixTransform();
+    }
+
+    _p.swapChain.generation = _p.s.generation();
+}
+
+static constexpr DXGI_SWAP_CHAIN_FLAG swapChainFlags = ATLAS_DEBUG_DISABLE_FRAME_LATENCY_WAITABLE_OBJECT ? DXGI_SWAP_CHAIN_FLAG{} : DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+
+void AtlasEngine::_createSwapChain()
+{
+    _destroySwapChain();
+
+    DXGI_SWAP_CHAIN_DESC1 desc{
+        .Width = _p.s->targetSize.x,
+        .Height = _p.s->targetSize.y,
+        .Format = DXGI_FORMAT_B8G8R8A8_UNORM,
+        .SampleDesc = { .Count = 1 },
+        .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        // Sometimes up to 2 buffers are locked, for instance during screen capture or when moving the window.
+        // 3 buffers seems to guarantee a stable framerate at display frequency at all times.
+        .BufferCount = 3,
+        .Scaling = DXGI_SCALING_NONE,
+        // DXGI_SWAP_EFFECT_FLIP_DISCARD is the easiest to use, because it's fast and uses little memory.
+        // But it's a mode that was created at a time were display drivers lacked support
+        // for Multiplane Overlays (MPO) and were copying buffers was expensive.
+        // This allowed DWM to quickly draw overlays (like gamebars) on top of rendered content.
+        // With faster GPU memory in general and with support for MPO in particular this isn't
+        // really an advantage anymore. Instead DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL allows for a
+        // more "intelligent" composition and display updates to occur like Panel Self Refresh
+        // (PSR) which requires dirty rectangles (Present1 API) to work correctly.
+        // We were asked by DWM folks to use DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL for this reason (PSR).
+        .SwapEffect = _p.s->target->disablePresent1 ? DXGI_SWAP_EFFECT_FLIP_DISCARD : DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+        // If our background is opaque we can enable "independent" flips by setting DXGI_ALPHA_MODE_IGNORE.
+        // As our swap chain won't have to compose with DWM anymore it reduces the display latency dramatically.
+        .AlphaMode = _p.s->target->useAlpha ? DXGI_ALPHA_MODE_PREMULTIPLIED : DXGI_ALPHA_MODE_IGNORE,
+        .Flags = swapChainFlags,
+    };
+
+    wil::com_ptr<IDXGISwapChain1> swapChain1;
+    wil::unique_handle handle;
+
+    if (_p.s->target->hwnd)
+    {
+        desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        THROW_IF_FAILED(_p.dxgi.factory->CreateSwapChainForHwnd(_p.device.get(), _p.s->target->hwnd, &desc, nullptr, nullptr, swapChain1.addressof()));
     }
     else
     {
-        _r.d2dRenderTarget->FillRectangle(&rect, _r.brush.get());
+        const auto module = GetModuleHandleW(L"dcomp.dll");
+        const auto DCompositionCreateSurfaceHandle = GetProcAddressByFunctionDeclaration(module, DCompositionCreateSurfaceHandle);
+        THROW_LAST_ERROR_IF(!DCompositionCreateSurfaceHandle);
+
+        // As per: https://docs.microsoft.com/en-us/windows/win32/api/dcomp/nf-dcomp-dcompositioncreatesurfacehandle
+        static constexpr DWORD COMPOSITIONSURFACE_ALL_ACCESS = 0x0003L;
+        THROW_IF_FAILED(DCompositionCreateSurfaceHandle(COMPOSITIONSURFACE_ALL_ACCESS, nullptr, handle.addressof()));
+        THROW_IF_FAILED(_p.dxgi.factory.query<IDXGIFactoryMedia>()->CreateSwapChainForCompositionSurfaceHandle(_p.device.get(), handle.get(), &desc, nullptr, swapChain1.addressof()));
     }
 
-    if (cursorType == CursorType::DoubleUnderscore)
+    _p.swapChain.swapChain = swapChain1.query<IDXGISwapChain2>();
+    _p.swapChain.handle = std::move(handle);
+    _p.swapChain.frameLatencyWaitableObject.reset(_p.swapChain.swapChain->GetFrameLatencyWaitableObject());
+    _p.swapChain.targetGeneration = _p.s->target.generation();
+    _p.swapChain.targetSize = _p.s->targetSize;
+    _p.swapChain.waitForPresentation = true;
+
+    LOG_IF_FAILED(_p.swapChain.swapChain->SetMaximumFrameLatency(1));
+
+    WaitUntilCanRender();
+
+    if (_p.swapChainChangedCallback)
     {
-        rect.top -= 2.0f;
-        rect.bottom -= 2.0f;
-        _r.d2dRenderTarget->FillRectangle(&rect, _r.brush.get());
+        try
+        {
+            _p.swapChainChangedCallback(_p.swapChain.handle.get());
+        }
+        CATCH_LOG()
+    }
+}
+
+void AtlasEngine::_destroySwapChain()
+{
+    if (_p.swapChain.swapChain)
+    {
+        // D3D11 defers the destruction of objects and only one swap chain can be associated with a
+        // HWND, IWindow, or composition surface at a time. --> Force the destruction of all objects.
+        _p.swapChain = {};
+        if (_b)
+        {
+            _b->ReleaseResources();
+        }
+        if (_p.deviceContext)
+        {
+            _p.deviceContext->ClearState();
+            _p.deviceContext->Flush();
+        }
+    }
+}
+
+void AtlasEngine::_resizeBuffers()
+{
+    _b->ReleaseResources();
+    _p.deviceContext->ClearState();
+
+    THROW_IF_FAILED(_p.swapChain.swapChain->ResizeBuffers(0, _p.s->targetSize.x, _p.s->targetSize.y, DXGI_FORMAT_UNKNOWN, swapChainFlags));
+    _p.swapChain.targetSize = _p.s->targetSize;
+}
+
+void AtlasEngine::_updateMatrixTransform()
+{
+    if (!_p.s->target->hwnd)
+    {
+        // XAML's SwapChainPanel combines the worst of both worlds and always applies a transform
+        // to the swap chain to make it match the display scale. This undoes the damage.
+        const DXGI_MATRIX_3X2_F matrix{
+            ._11 = static_cast<f32>(USER_DEFAULT_SCREEN_DPI) / static_cast<f32>(_p.s->font->dpi),
+            ._22 = static_cast<f32>(USER_DEFAULT_SCREEN_DPI) / static_cast<f32>(_p.s->font->dpi),
+        };
+        THROW_IF_FAILED(_p.swapChain.swapChain->SetMatrixTransform(&matrix));
+    }
+    _p.swapChain.fontGeneration = _p.s->font.generation();
+}
+
+void AtlasEngine::_waitUntilCanRender() noexcept
+{
+    // IDXGISwapChain2::GetFrameLatencyWaitableObject returns an auto-reset event.
+    // Once we've waited on the event, waiting on it again will block until the timeout elapses.
+    // _waitForPresentation guards against this.
+    if constexpr (!ATLAS_DEBUG_DISABLE_FRAME_LATENCY_WAITABLE_OBJECT)
+    {
+        if (_p.swapChain.waitForPresentation)
+        {
+            WaitForSingleObjectEx(_p.swapChain.frameLatencyWaitableObject.get(), 100, true);
+            _p.swapChain.waitForPresentation = false;
+        }
+    }
+}
+
+void AtlasEngine::_present()
+{
+    const RECT fullRect{ 0, 0, _p.swapChain.targetSize.x, _p.swapChain.targetSize.y };
+
+    DXGI_PRESENT_PARAMETERS params{};
+    RECT scrollRect{};
+    POINT scrollOffset{};
+
+    // Since rows might be taller than their cells, they might have drawn outside of the viewport.
+    RECT dirtyRect{
+        .left = std::max(_p.dirtyRectInPx.left, 0),
+        .top = std::max(_p.dirtyRectInPx.top, 0),
+        .right = std::min<LONG>(_p.dirtyRectInPx.right, fullRect.right),
+        .bottom = std::min<LONG>(_p.dirtyRectInPx.bottom, fullRect.bottom),
+    };
+
+    // Present1() dislikes being called with an empty dirty rect.
+    if (dirtyRect.left >= dirtyRect.right || dirtyRect.top >= dirtyRect.bottom)
+    {
+        return;
     }
 
-    _r.d2dRenderTarget->PopAxisAlignedClip();
-    THROW_IF_FAILED(_r.d2dRenderTarget->EndDraw());
+#pragma warning(suppress : 4127) // conditional expression is constant
+    if (!ATLAS_DEBUG_SHOW_DIRTY && !_p.s->target->disablePresent1 && memcmp(&dirtyRect, &fullRect, sizeof(RECT)) != 0)
+    {
+        params.DirtyRectsCount = 1;
+        params.pDirtyRects = &dirtyRect;
+
+        if (_p.scrollDeltaY)
+        {
+            const auto offsetInPx = _p.scrollDeltaY * _p.s->font->cellSize.y;
+            const auto width = _p.s->targetSize.x;
+            // We don't use targetSize.y here, because "height" refers to the bottom coordinate of the last text row
+            // in the buffer. We then add the "offsetInPx" (which is negative when scrolling text upwards) and thus
+            // end up with a "bottom" value that is the bottom of the last row of text that we haven't invalidated.
+            const auto height = _p.s->viewportCellCount.y * _p.s->font->cellSize.y;
+            const auto top = std::max(0, offsetInPx);
+            const auto bottom = height + std::min(0, offsetInPx);
+
+            scrollRect = { 0, top, width, bottom };
+            scrollOffset = { 0, offsetInPx };
+
+            params.pScrollRect = &scrollRect;
+            params.pScrollOffset = &scrollOffset;
+        }
+    }
+
+    auto hr = _p.swapChain.swapChain->Present1(1, 0, &params);
+    if constexpr (Feature_AtlasEnginePresentFallback::IsEnabled())
+    {
+        if (FAILED(hr) && params.DirtyRectsCount != 0)
+        {
+            hr = _p.swapChain.swapChain->Present(1, 0);
+        }
+    }
+    THROW_IF_FAILED(hr);
+
+    _p.swapChain.waitForPresentation = true;
 }

@@ -70,7 +70,7 @@ namespace winrt::TerminalApp::implementation
                     TraceLoggingDescription("Event emitted when the Command Palette is opened"),
                     TraceLoggingWideString(L"Action", "Mode", "which mode the palette was opened in"),
                     TraceLoggingKeyword(MICROSOFT_KEYWORD_MEASURES),
-                    TelemetryPrivacyDataTag(PDT_ProductAndServicePerformance));
+                    TelemetryPrivacyDataTag(PDT_ProductAndServiceUsage));
             }
             else
             {
@@ -235,7 +235,7 @@ namespace winrt::TerminalApp::implementation
         {
             if (const auto actionPaletteItem{ filteredCommand.Item().try_as<winrt::TerminalApp::ActionPaletteItem>() })
             {
-                _PreviewActionHandlers(*this, actionPaletteItem.Command());
+                PreviewAction.raise(*this, actionPaletteItem.Command());
             }
         }
         else if (_currentMode == CommandPaletteMode::CommandlineMode)
@@ -359,7 +359,7 @@ namespace winrt::TerminalApp::implementation
             _switchToMode(CommandPaletteMode::CommandlineMode);
             e.Handled(true);
         }
-        else if (key == VirtualKey::C && ctrlDown)
+        else if ((key == VirtualKey::C || key == VirtualKey::Insert) && ctrlDown)
         {
             _searchBox().CopySelectionToClipboard();
             e.Handled(true);
@@ -474,7 +474,13 @@ namespace winrt::TerminalApp::implementation
             return;
         }
 
-        auto focusedElementOrAncestor = Input::FocusManager::GetFocusedElement(this->XamlRoot()).try_as<DependencyObject>();
+        auto root = this->XamlRoot();
+        if (!root)
+        {
+            return;
+        }
+
+        auto focusedElementOrAncestor = Input::FocusManager::GetFocusedElement(root).try_as<DependencyObject>();
         while (focusedElementOrAncestor)
         {
             if (focusedElementOrAncestor == *this)
@@ -524,6 +530,34 @@ namespace winrt::TerminalApp::implementation
         }
     }
 
+    void CommandPalette::_listItemSelectionChanged(const Windows::Foundation::IInspectable& /*sender*/, const Windows::UI::Xaml::Controls::SelectionChangedEventArgs& e)
+    {
+        // We don't care about...
+        // - CommandlineMode: it doesn't have any selectable items in the list view
+        // - TabSwitchMode: focus and selected item are in sync
+        if (_currentMode == CommandPaletteMode::ActionMode || _currentMode == CommandPaletteMode::TabSearchMode)
+        {
+            if (auto automationPeer{ Automation::Peers::FrameworkElementAutomationPeer::FromElement(_searchBox()) })
+            {
+                if (const auto selectedList = e.AddedItems(); selectedList.Size() > 0)
+                {
+                    const auto selectedCommand = selectedList.GetAt(0);
+                    if (const auto filteredCmd = selectedCommand.try_as<TerminalApp::FilteredCommand>())
+                    {
+                        if (const auto paletteItem = filteredCmd.Item().try_as<TerminalApp::PaletteItem>())
+                        {
+                            automationPeer.RaiseNotificationEvent(
+                                Automation::Peers::AutomationNotificationKind::ItemAdded,
+                                Automation::Peers::AutomationNotificationProcessing::MostRecent,
+                                paletteItem.Name() + L" " + paletteItem.KeyChordText(),
+                                L"CommandPaletteSelectedItemChanged" /* unique name for this notification category */);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Method Description:
     // This event is called when the user clicks on a ChevronLeft button right
     // next to the ParentCommandName (e.g. New Tab...) above the subcommands list.
@@ -535,7 +569,7 @@ namespace winrt::TerminalApp::implementation
     void CommandPalette::_moveBackButtonClicked(const Windows::Foundation::IInspectable& /*sender*/,
                                                 const Windows::UI::Xaml::RoutedEventArgs&)
     {
-        _PreviewActionHandlers(*this, nullptr);
+        PreviewAction.raise(*this, nullptr);
         _searchBox().Focus(FocusState::Programmatic);
 
         const auto previousAction{ _nestedActionStack.GetAt(_nestedActionStack.Size() - 1) };
@@ -592,7 +626,7 @@ namespace winrt::TerminalApp::implementation
             automationPeer.RaiseNotificationEvent(
                 Automation::Peers::AutomationNotificationKind::ActionCompleted,
                 Automation::Peers::AutomationNotificationProcessing::CurrentThenMostRecent,
-                fmt::format(std::wstring_view{ RS_(L"CommandPalette_NestedCommandAnnouncement") }, ParentCommandName()),
+                RS_fmt(L"CommandPalette_NestedCommandAnnouncement", ParentCommandName()),
                 L"CommandPaletteNestingLevelChanged" /* unique name for this notification category */);
         }
     }
@@ -680,7 +714,7 @@ namespace winrt::TerminalApp::implementation
                     // All other actions can just be dispatched.
                     if (actionPaletteItem.Command().ActionAndArgs().Action() != ShortcutAction::ToggleCommandPalette)
                     {
-                        _DispatchCommandRequestedHandlers(*this, actionPaletteItem.Command());
+                        DispatchCommandRequested.raise(*this, actionPaletteItem.Command());
                     }
 
                     TraceLoggingWrite(
@@ -690,7 +724,7 @@ namespace winrt::TerminalApp::implementation
                         TraceLoggingUInt32(searchTextLength, "SearchTextLength", "Number of characters in the search string"),
                         TraceLoggingUInt32(nestedCommandDepth, "NestedCommandDepth", "the depth in the tree of commands for the dispatched action"),
                         TraceLoggingKeyword(MICROSOFT_KEYWORD_MEASURES),
-                        TelemetryPrivacyDataTag(PDT_ProductAndServicePerformance));
+                        TelemetryPrivacyDataTag(PDT_ProductAndServiceUsage));
                 }
             }
         }
@@ -734,7 +768,7 @@ namespace winrt::TerminalApp::implementation
             {
                 if (const auto tab{ tabPaletteItem.Tab() })
                 {
-                    _SwitchToTabRequestedHandlers(*this, tab);
+                    SwitchToTabRequested.raise(*this, tab);
                 }
             }
         }
@@ -758,11 +792,11 @@ namespace winrt::TerminalApp::implementation
                 "CommandPaletteDispatchedCommandline",
                 TraceLoggingDescription("Event emitted when the user runs a commandline in the Command Palette"),
                 TraceLoggingKeyword(MICROSOFT_KEYWORD_MEASURES),
-                TelemetryPrivacyDataTag(PDT_ProductAndServicePerformance));
+                TelemetryPrivacyDataTag(PDT_ProductAndServiceUsage));
 
             if (const auto commandLinePaletteItem{ filteredCommand.value().Item().try_as<winrt::TerminalApp::CommandLinePaletteItem>() })
             {
-                _CommandLineExecutionRequestedHandlers(*this, commandLinePaletteItem.CommandLine());
+                CommandLineExecutionRequested.raise(*this, commandLinePaletteItem.CommandLine());
                 _close();
             }
         }
@@ -796,7 +830,7 @@ namespace winrt::TerminalApp::implementation
             "CommandPaletteDismissed",
             TraceLoggingDescription("Event emitted when the user dismisses the Command Palette without selecting an action"),
             TraceLoggingKeyword(MICROSOFT_KEYWORD_MEASURES),
-            TelemetryPrivacyDataTag(PDT_ProductAndServicePerformance));
+            TelemetryPrivacyDataTag(PDT_ProductAndServiceUsage));
     }
 
     // Method Description:
@@ -809,6 +843,16 @@ namespace winrt::TerminalApp::implementation
     void CommandPalette::_filterTextChanged(const IInspectable& /*sender*/,
                                             const Windows::UI::Xaml::RoutedEventArgs& /*args*/)
     {
+        // When we are executing the _SelectNextTab in the TabManagement.cpp, this method
+        // is getting triggered because we set up the default value for that CommandPalette
+        // with an empty string. Therefore, to avoid the reset of the index when executing
+        // the Next/Prev tab command, we are skipping this execution.
+        // Check issue https://github.com/microsoft/terminal/issues/11146
+        if (_currentMode == CommandPaletteMode::TabSwitchMode)
+        {
+            return;
+        }
+
         if (_currentMode == CommandPaletteMode::CommandlineMode)
         {
             _evaluatePrefix();
@@ -835,7 +879,7 @@ namespace winrt::TerminalApp::implementation
                     Automation::Peers::AutomationNotificationKind::ActionCompleted,
                     Automation::Peers::AutomationNotificationProcessing::ImportantMostRecent,
                     currentNeedleHasResults ?
-                        winrt::hstring{ fmt::format(std::wstring_view{ RS_(L"CommandPalette_MatchesAvailable") }, _filteredActions.Size()) } :
+                        winrt::hstring{ RS_fmt(L"CommandPalette_MatchesAvailable", _filteredActions.Size()) } :
                         NoMatchesText(), // what to announce if results were found
                     L"CommandPaletteResultAnnouncement" /* unique name for this group of notifications */);
             }
@@ -906,21 +950,27 @@ namespace winrt::TerminalApp::implementation
     void CommandPalette::SetActionMap(const Microsoft::Terminal::Settings::Model::IActionMapView& actionMap)
     {
         _actionMap = actionMap;
+        _populateCommands();
     }
 
-    void CommandPalette::SetCommands(const Collections::IVector<Command>& actions)
+    void CommandPalette::_populateCommands()
     {
         _allCommands.Clear();
-        for (const auto& action : actions)
+        if (_actionMap)
         {
-            auto actionPaletteItem{ winrt::make<winrt::TerminalApp::implementation::ActionPaletteItem>(action) };
-            auto filteredCommand{ winrt::make<FilteredCommand>(actionPaletteItem) };
-            _allCommands.Append(filteredCommand);
-        }
+            const auto expandedCommands{ _actionMap.ExpandedCommands() };
+            for (const auto& action : expandedCommands)
+            {
+                const auto keyChordText{ KeyChordSerialization::ToString(_actionMap.GetKeyBindingForAction(action.ID())) };
+                auto actionPaletteItem{ winrt::make<winrt::TerminalApp::implementation::ActionPaletteItem>(action, keyChordText) };
+                auto filteredCommand{ winrt::make<FilteredCommand>(actionPaletteItem) };
+                _allCommands.Append(filteredCommand);
+            }
 
-        if (Visibility() == Visibility::Visible && _currentMode == CommandPaletteMode::ActionMode)
-        {
-            _updateFilteredActions();
+            if (Visibility() == Visibility::Visible && _currentMode == CommandPaletteMode::ActionMode)
+            {
+                _updateFilteredActions();
+            }
         }
     }
 
@@ -1134,7 +1184,8 @@ namespace winrt::TerminalApp::implementation
         for (const auto& nameAndCommand : parentCommand.NestedCommands())
         {
             const auto action = nameAndCommand.Value();
-            auto nestedActionPaletteItem{ winrt::make<winrt::TerminalApp::implementation::ActionPaletteItem>(action) };
+            // nested commands cannot have keys bound to them, so just pass in the command and no keys
+            auto nestedActionPaletteItem{ winrt::make<winrt::TerminalApp::implementation::ActionPaletteItem>(action, winrt::hstring{}) };
             auto nestedFilteredCommand{ winrt::make<FilteredCommand>(nestedActionPaletteItem) };
             _currentNestedCommands.Append(nestedFilteredCommand);
         }
@@ -1153,8 +1204,6 @@ namespace winrt::TerminalApp::implementation
     {
         Visibility(Visibility::Collapsed);
 
-        _PreviewActionHandlers(*this, nullptr);
-
         // Reset visibility in case anchor mode tab switcher just finished.
         _searchBox().Visibility(Visibility::Visible);
 
@@ -1165,6 +1214,7 @@ namespace winrt::TerminalApp::implementation
 
         ParentCommandName(L"");
         _currentNestedCommands.Clear();
+        PreviewAction.raise(*this, nullptr);
     }
 
     void CommandPalette::EnableTabSwitcherMode(const uint32_t startIdx, TabSwitcherMode tabSwitcherMode)
@@ -1304,7 +1354,7 @@ namespace winrt::TerminalApp::implementation
         // there aren't any recent commands, then just store the new command.
         if (!recentCommands)
         {
-            ApplicationState::SharedInstance().RecentCommands(single_threaded_vector(std::move(std::vector{ command })));
+            ApplicationState::SharedInstance().RecentCommands(single_threaded_vector(std::vector{ command }));
             return;
         }
 

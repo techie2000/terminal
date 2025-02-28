@@ -49,7 +49,8 @@ void SystemConfigurationProvider::GetSettingsFromLink(
     _Inout_updates_bytes_(*pdwTitleLength) LPWSTR /*pwszTitle*/,
     _Inout_ PDWORD /*pdwTitleLength*/,
     _In_ PCWSTR /*pwszCurrDir*/,
-    _In_ PCWSTR /*pwszAppName*/)
+    _In_ PCWSTR /*pwszAppName*/,
+    _Inout_opt_ IconInfo* /*iconInfo*/)
 {
     // While both OneCore console renderers use TrueType fonts, there is no
     // advanced font support on that platform. Namely, there is no way to pick
@@ -60,6 +61,7 @@ void SystemConfigurationProvider::GetSettingsFromLink(
     // Hence, we make it seem like the console is in fact configured to use a
     // TrueType font by the user.
 
+#pragma warning(suppress : 26485) // This isn't even really _supposed to be_ an array-to-pointer decay: it's passed as a string view.
     pLinkSettings->SetFaceName(DEFAULT_TT_FONT_FACENAME);
     pLinkSettings->SetFontFamily(TMPF_TRUETYPE);
 

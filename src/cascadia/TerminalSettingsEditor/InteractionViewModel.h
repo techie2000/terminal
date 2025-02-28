@@ -14,7 +14,8 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
     public:
         InteractionViewModel(Model::GlobalAppSettings globalSettings);
 
-        WINRT_CALLBACK(PropertyChanged, Windows::UI::Xaml::Data::PropertyChangedEventHandler);
+        // DON'T YOU DARE ADD A `WINRT_CALLBACK(PropertyChanged` TO A CLASS DERIVED FROM ViewModelHelper. Do this instead:
+        using ViewModelHelper<InteractionViewModel>::PropertyChanged;
 
         GETSET_BINDABLE_ENUM_SETTING(TabSwitcherMode, Model::TabSwitcherMode, _GlobalSettings.TabSwitcherMode);
         GETSET_BINDABLE_ENUM_SETTING(CopyFormat, winrt::Microsoft::Terminal::Control::CopyFormat, _GlobalSettings.CopyFormatting);
@@ -25,7 +26,13 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
         PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, SnapToGridOnResize);
         PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, FocusFollowMouse);
         PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, DetectURLs);
+        PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, SearchWebDefaultQueryUrl);
         PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, WordDelimiters);
+        PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, ConfirmCloseAllTabs);
+        PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, InputServiceWarning);
+        PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, WarnAboutLargePaste);
+        PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, WarnAboutMultiLinePaste);
+        PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, EnableColorSelection);
 
     private:
         Model::GlobalAppSettings _GlobalSettings;

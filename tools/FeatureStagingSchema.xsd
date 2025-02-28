@@ -1,4 +1,4 @@
-<?xml version="1.0"?>
+<?xml version="1.0" encoding="utf-8"?>
 <xs:schema targetNamespace="http://microsoft.com/TilFeatureStaging-Schema.xsd"
     elementFormDefault="qualified"
     xmlns="http://microsoft.com/TilFeatureStaging-Schema.xsd"
@@ -61,7 +61,7 @@
     </xs:simpleType>
     <xs:simpleType name="brandingType">
         <xs:restriction base="til:stringNoEmpty">
-            <xs:pattern value="Dev|Preview|Release|WindowsInbox" />
+            <xs:pattern value="Dev|Canary|Preview|Release|WindowsInbox" />
         </xs:restriction>
     </xs:simpleType>
     <xs:complexType name="brandingTokenListType">

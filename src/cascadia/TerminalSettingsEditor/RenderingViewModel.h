@@ -4,21 +4,21 @@
 #pragma once
 
 #include "RenderingViewModel.g.h"
-#include "ViewModelHelpers.h"
 #include "Utils.h"
+#include "ViewModelHelpers.h"
 
 namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
 {
     struct RenderingViewModel : RenderingViewModelT<RenderingViewModel>, ViewModelHelper<RenderingViewModel>
     {
-    public:
-        RenderingViewModel(Model::GlobalAppSettings globalSettings);
+        explicit RenderingViewModel(Model::CascadiaSettings settings) noexcept;
 
-        PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, ForceFullRepaintRendering);
-        PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, SoftwareRendering);
+        GETSET_BINDABLE_ENUM_SETTING(GraphicsAPI, winrt::Microsoft::Terminal::Control::GraphicsAPI, _settings.GlobalSettings().GraphicsAPI);
+        PERMANENT_OBSERVABLE_PROJECTED_SETTING(_settings.GlobalSettings(), DisablePartialInvalidation);
+        PERMANENT_OBSERVABLE_PROJECTED_SETTING(_settings.GlobalSettings(), SoftwareRendering);
 
     private:
-        Model::GlobalAppSettings _GlobalSettings;
+        Model::CascadiaSettings _settings{ nullptr };
     };
 };
 

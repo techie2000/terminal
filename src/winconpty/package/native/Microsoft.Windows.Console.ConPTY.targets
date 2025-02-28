@@ -1,15 +1,15 @@
-<?xml version="1.0"?>
-<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemDefinitionGroup>
     <ClCompile>
       <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..\..\inc\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(MSBuildThisFileDirectory)..\..\runtimes\win10-$(ConptyNativePlatform)\lib\uap10.0\conpty.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(MSBuildThisFileDirectory)..\..\runtimes\win-$(ConptyNativePlatform)\lib\uap10.0\conpty.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ReferenceCopyLocalPaths Include="$(MSBuildThisFileDirectory)..\..\runtimes\win10-$(ConptyNativePlatform)\native\conpty.dll" />
+    <ReferenceCopyLocalPaths Include="$(MSBuildThisFileDirectory)..\..\runtimes\win-$(ConptyNativePlatform)\native\conpty.dll" />
     <ReferenceCopyLocalPaths Condition="'$(ConptyRequiresx86Host)'=='true'" Include="$(MSBuildThisFileDirectory)\runtimes\x86\OpenConsole.exe">
       <DestinationSubDirectory>x86\</DestinationSubDirectory>
     </ReferenceCopyLocalPaths>
